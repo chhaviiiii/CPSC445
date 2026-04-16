@@ -1,4 +1,10 @@
-"""Shared paths for notebooks — does not depend on Jupyter's current working directory."""
+"""Shared helpers for the CPSC 445 scRNA-seq pipeline.
+
+Used by ``01_preprocess.py`` and ``02_scvi_extension.py`` so notebook CWD does not matter.
+The important bit is ``ensure_coarse_label``: CellxGene h5ads often have one value in
+``cell_type_super`` per file, so coarse agreement with paper labels must be derived from
+``cluster_label`` string prefixes instead.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -21,6 +27,8 @@ def ensure_coarse_label(adata: AnnData, *, cluster_col: str = "cluster_label", o
 
     ``cell_type_super`` is often a single value per split h5ad (e.g. T.super); coarse ARI
     should use this column instead. Non-matching labels are set to ``\"Other\"``.
+
+    Returns True if ``out_col`` already exists or was created; False if ``cluster_col`` is missing.
     """
     if cluster_col not in adata.obs.columns:
         return False

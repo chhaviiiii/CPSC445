@@ -2,6 +2,19 @@
 02_scvi_extension.py
 Vázquez-García et al., Nature 2022 — scVI Extension (Week 2)
 Swaps PCA with a VAE latent space and compares cluster quality.
+
+Prerequisite: run ``01_preprocess.py`` first to create ``data/adata_preprocessed.h5ad``.
+
+This script:
+  (1) Trains scVI on raw counts (``layers['counts']``) with patient as batch when available.
+  (2) Builds UMAP + Leiden from the scVI latent space.
+  (3) Reloads the PCA object for a fair PCA vs scVI UMAP figure (fresh read = clean obsm).
+  (4) Runs Harmony on ``X_pca`` (see ``harmony_corrected_pca``) → neighbors → UMAP → Leiden.
+  (5) Writes ``data/pca_vs_scvi_metrics.csv``: coarse ARI (``coarse_label``), granular ARI
+      (``cluster_label``), silhouette for PCA / PCA+Harmony / scVI.
+
+ARI: coarse lineage is derived in ``project_utils.ensure_coarse_label``; do not use
+``cell_type_super`` alone when the h5ad is T-cell-only (single class).
 """
 
 import os
@@ -44,10 +57,10 @@ def harmony_corrected_pca(adata, batch_key: str, basis: str = "X_pca", out_key: 
 # ── Config ────────────────────────────────────────────────────────────────────
 PREPROCESSED_PATH = "data/adata_preprocessed.h5ad"
 SEED              = 42
-N_LATENT          = 10
+N_LATENT          = 10  # scVI bottleneck size (latent dim)
 N_LAYERS          = 2
 N_HIDDEN          = 128
-PAPER_RESOLUTION  = 0.5   # match what you used in 01_preprocess.py
+PAPER_RESOLUTION  = 0.5   # keep identical to 01_preprocess for Leiden comparison
 RESOLUTIONS       = [0.1, 0.3, 0.5, 0.8, 1.0, 1.5]
 MAX_EPOCHS        = 400
 
@@ -67,12 +80,13 @@ print(f"GPU available: {torch.cuda.is_available()}")
 adata = sc.read_h5ad(PREPROCESSED_PATH)
 print(f"\nLoaded: {adata.n_obs} cells × {adata.n_vars} genes")
 
+# Coarse labels for ARI (from cluster_label prefixes); idempotent if 01 already saved them.
 ensure_coarse_label(adata)
 COARSE_REF_COL = "coarse_label" if "coarse_label" in adata.obs.columns else None
 
 adata_scvi = adata.copy()
 
-# scVI requires raw integer counts
+# scVI fits on raw counts (NB likelihood); normalized matrix in .X is not used for training here.
 if "counts" not in adata_scvi.layers:
     print("counts layer not found — using adata.raw.X")
     adata_scvi.layers["counts"] = adata_scvi.raw.X.copy()
@@ -98,6 +112,7 @@ GENE_SYM_COL = next((c for c in ("feature_name", "gene_name") if c in adata_scvi
 
 
 # ── 2. Set up and train scVI ──────────────────────────────────────────────────
+# batch_key: scVI learns patient-specific scaling / mixing; same key as Harmony when possible.
 scvi.model.SCVI.setup_anndata(
     adata_scvi,
     layer="counts",
@@ -140,6 +155,7 @@ print("Model saved to data/scvi_model/")
 
 
 # ── 3. Latent space → UMAP → Leiden ──────────────────────────────────────────
+# Neighbors on latent space, not on PCA — this is the “scVI embedding” analysis path.
 adata_scvi.obsm["X_scVI"] = model.get_latent_representation()
 print(f"Latent shape: {adata_scvi.obsm['X_scVI'].shape}")
 
@@ -151,10 +167,12 @@ print(f"scVI Leiden (res={PAPER_RESOLUTION}): {adata_scvi.obs['leiden_scvi'].nun
 
 
 # ── 4. Side-by-side UMAP comparison ──────────────────────────────────────────
-adata_pca = sc.read_h5ad(PREPROCESSED_PATH)   # PCA-based from notebook 01
+# Second load: keeps PCA UMAP / leiden_paper_res from 01 without scVI-side mutations.
+adata_pca = sc.read_h5ad(PREPROCESSED_PATH)
 ensure_coarse_label(adata_pca)
 adata_harmony = adata_pca.copy()
 
+# Harmony adjusts batch effects in PC space; graph + UMAP are recomputed from X_pca_harmony.
 if batch_col and batch_col in adata_harmony.obs.columns:
     harmony_corrected_pca(adata_harmony, batch_key=batch_col, basis="X_pca")
     sc.pp.neighbors(adata_harmony, use_rep="X_pca_harmony", n_neighbors=15, random_state=SEED)
@@ -189,6 +207,7 @@ print("Saved figures/pca_vs_scvi_umap.png")
 
 # ── 5. Quantitative evaluation (ARI + silhouette) ────────────────────────────
 def _ari_against(obs_df, cluster_col, ref_col):
+    """Adjusted Rand index between Leiden (cluster_col) and paper labels (ref_col)."""
     if (not ref_col) or (ref_col not in obs_df.columns):
         return np.nan
     ref = obs_df[ref_col].astype("category")
@@ -199,6 +218,7 @@ def _ari_against(obs_df, cluster_col, ref_col):
     return adjusted_rand_score(ref_codes, clusters)
 
 
+# One table row per method; silhouette uses the same subsample size for comparability.
 rows = []
 pca_labels = adata_pca.obs["leiden_paper_res"].astype(int).values
 rows.append(
@@ -207,6 +227,7 @@ rows.append(
         "N_clusters": adata_pca.obs["leiden_paper_res"].nunique(),
         "ARI_coarse": _ari_against(adata_pca.obs, "leiden_paper_res", COARSE_REF_COL),
         "ARI_granular": _ari_against(adata_pca.obs, "leiden_paper_res", ARI_REF_COL),
+        # First 30 PCs — same dimensionality cap as typical neighbors usage in 01.
         "Silhouette": silhouette_score(
             adata_pca.obsm["X_pca"][:, :30], pca_labels, sample_size=5000, random_state=SEED
         ),
@@ -271,7 +292,7 @@ if len(pca_row) and len(harm_row):
         )
 results.to_csv("data/pca_vs_scvi_metrics.csv", index=False)
 
-# Bar chart
+# Three panels: coarse ARI (lineage), granular ARI (paper subtypes), internal silhouette.
 fig, axes = plt.subplots(1, 3, figsize=(14, 4))
 for ax, metric, title in zip(
     axes,
@@ -294,7 +315,7 @@ plt.savefig("figures/pca_vs_scvi_metrics.png", dpi=150, bbox_inches="tight")
 plt.close()
 
 
-# ── 6. Marker gene check ──────────────────────────────────────────────────────
+# ── 6. Marker gene check (scVI clusters) ──────────────────────────────────────
 MARKER_GENES = {
     "Tumor":       ["EPCAM", "KRT8", "KRT18", "PAX8"],
     "CD8 T cell":  ["CD8A", "CD8B", "GZMB"],
@@ -321,7 +342,7 @@ if GENE_SYM_COL is not None:
 sc.pl.dotplot(adata_scvi, var_names=avail, groupby="leiden_scvi", **_dot_kw)
 
 
-# ── 7. Resolution sweep on scVI ───────────────────────────────────────────────
+# ── 7. Resolution sweep on scVI (same grid as 01 for side-by-side reporting) ──
 for res in RESOLUTIONS:
     sc.tl.leiden(adata_scvi, resolution=res, random_state=SEED, key_added=f"leiden_scvi_res_{res}")
     print(f"  scVI res={res} → {adata_scvi.obs[f'leiden_scvi_res_{res}'].nunique()} clusters")

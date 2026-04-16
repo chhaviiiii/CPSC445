@@ -2,6 +2,16 @@
 01_preprocess.py
 Vázquez-García et al., Nature 2022 — Ovarian Cancer scRNA-seq Reproduction
 Pipeline: Download → QC → Normalize → HVG → PCA → UMAP → Leiden clustering
+
+Flow summary:
+  (1) Pull first .h5ad from the CellxGene collection (see COLLECTION_ID).
+  (2) QC filter cells/genes; keep ``layers['counts']`` for later HVG + scVI.
+  (3) Subset to HVGs for PCA, but keep full normalized matrix in ``.raw`` for markers/DE.
+  (4) Leiden at PAPER_RESOLUTION + a resolution sweep for the report.
+  (5) Figures + ``cluster_markers.csv``; save ``adata_preprocessed.h5ad`` for Week 2.
+
+Gene IDs: CellxGene uses Ensembl IDs in ``var_names``; human-readable symbols live in
+``feature_name`` / ``gene_name`` (see GENE_SYM_COL) for dot plots and MT- detection.
 """
 
 import os
@@ -19,6 +29,7 @@ from project_utils import ensure_coarse_label
 warnings.filterwarnings("ignore")
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# CellxGene collection UUID — API lists multiple datasets; we download datasets[0] only.
 COLLECTION_ID    = "4796c91c-9d8f-4692-be43-347b1727f9d8"
 DATA_PATH        = "data/vazquez_garcia_2022.h5ad"
 PREPROCESSED_PATH = "data/adata_preprocessed.h5ad"
@@ -28,8 +39,9 @@ MAX_GENES        = 6000
 MAX_MT_PCT       = 20.0
 MIN_CELLS        = 3
 N_HVG            = 2000
-N_PCS            = 30
-PAPER_RESOLUTION = 0.5   # update after checking paper's Methods section
+N_PCS            = 30  # PCs fed into neighbors graph (≤ number of PCs from sc.tl.pca)
+PAPER_RESOLUTION = 0.5   # primary Leiden resolution for figures / comparison to 02_scvi
+# Extra resolutions only for sensitivity plots (not the main “paper” cluster key)
 RESOLUTIONS      = [0.1, 0.3, 0.5, 0.8, 1.0, 1.5]
 
 np.random.seed(SEED)
@@ -59,6 +71,7 @@ def download_dataset(collection_id, output_path):
     for i, ds in enumerate(datasets):
         print(f"  [{i}] {ds.get('title', 'Unnamed')}  |  id: {ds.get('dataset_id')}")
 
+    # Change index here if you need myeloid / tumor / another compartment’s h5ad.
     dataset_id = datasets[0]["dataset_id"]
     dl_url = f"https://datasets.cellxgene.cziscience.com/{dataset_id}.h5ad"
     print(f"\nDownloading {dl_url} ...")
@@ -97,7 +110,7 @@ if "cell_type_super" in adata.obs.columns:
 print("obs columns:", adata.obs.columns.tolist())
 print("obsm keys:  ", list(adata.obsm.keys()))
 
-# Save raw counts before any modification
+# Integer counts for Seurat-v3 HVGs and for scVI in 02 (must exist before normalization).
 adata.layers["counts"] = adata.X.copy()
 
 # Identify useful columns
@@ -152,12 +165,14 @@ if ensure_coarse_label(adata):
 
 
 # ── 4. Normalize ──────────────────────────────────────────────────────────────
+# Log-normalized counts in .X; raw counts stay in layers['counts'].
 sc.pp.normalize_total(adata, target_sum=1e4)
 sc.pp.log1p(adata)
 print("Normalization + log1p done.")
 
 
 # ── 5. HVG selection ──────────────────────────────────────────────────────────
+# batch_key: variance stabilization within patient blocks when present.
 sc.pp.highly_variable_genes(
     adata,
     n_top_genes=N_HVG,
@@ -175,6 +190,7 @@ print("Subset to HVGs; full gene matrix kept in adata.raw for markers and DE.")
 
 
 # ── 6. PCA → Neighbors → UMAP ────────────────────────────────────────────────
+# Z-score HVGs for PCA; 50 PCs stored but graph uses first N_PCS to match typical practice.
 sc.pp.scale(adata, max_value=10)
 sc.tl.pca(adata, n_comps=50, svd_solver="arpack", random_state=SEED)
 sc.pp.neighbors(adata, n_neighbors=15, n_pcs=N_PCS, random_state=SEED)
@@ -258,6 +274,7 @@ print(
 
 
 # ── 9. Marker genes ───────────────────────────────────────────────────────────
+# Dict keys = plot groups; values = HGNC symbols (resolved via GENE_SYM_COL → Ensembl rows).
 MARKER_GENES = {
     "Tumor":       ["EPCAM", "KRT8", "KRT18", "PAX8", "MUC16"],
     "CD8 T cell":  ["CD8A", "CD8B", "GZMB", "PRF1"],
@@ -267,6 +284,7 @@ MARKER_GENES = {
     "Endothelial": ["PECAM1", "VWF", "CDH5"],
 }
 
+# .raw holds all genes (not just HVGs) so known markers still appear in dotplot/DE.
 if GENE_SYM_COL is not None:
     _sym_set = set(adata.raw.var[GENE_SYM_COL].astype(str))
     available_markers = {
@@ -307,6 +325,7 @@ print("Marker table saved to data/cluster_markers.csv")
 
 
 # ── 10. Cluster vs. paper annotation heatmap ─────────────────────────────────
+# Rows = our Leiden; cols = paper fine-grained labels (not cell_type_super — often one class).
 if "cluster_label" in adata.obs.columns:
     crosstab = pd.crosstab(
         adata.obs["leiden_paper_res"],
